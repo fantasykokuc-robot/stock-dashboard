@@ -22,7 +22,7 @@ st.markdown("""
 # ==================== 💾 資料庫與清單管理 ====================
 @st.cache_data
 def load_stock_dict():
-    """讀取靜態台股代碼表，供 PC 端全市場掃描與名稱對照使用"""
+    """讀取靜態台股代碼表[cite: 2]"""
     if os.path.exists('twse_listed_codes.csv'):
         try:
             df = pd.read_csv('twse_listed_codes.csv', encoding='utf-8-sig', header=None)
@@ -48,7 +48,15 @@ if 'watchlist' not in st.session_state:
     else:
         st.session_state.watchlist = ["2330", "2317", "2603", "3231", "2454"]
 
-ETF_LIST = ["0050", "006208", "0056", "00878", "00919"]
+# 擴充至 20 檔台灣發行之優質 ETF
+ETF_DICT = {
+    "0050": "大盤市值", "006208": "大盤市值", "00692": "大盤市值", "00922": "大盤市值", "00923": "大盤市值",
+    "0056": "高息低波", "00878": "高息低波", "00713": "高息低波", "00919": "高息低波", "00929": "高息低波", 
+    "00939": "高息低波", "00940": "高息低波",
+    "00881": "科技主題", "00891": "科技主題", "00892": "科技主題", "00935": "科技主題",
+    "00679B": "防禦美債", "00687B": "防禦美債", "00720B": "投資級債", "00751B": "投資級債"
+}
+ETF_LIST = list(ETF_DICT.keys())
 
 # ==================== 📱 側邊欄：動態清單與圖表選擇 ====================
 with st.sidebar:
@@ -70,7 +78,7 @@ with st.sidebar:
         st.rerun()
         
     st.divider()
-    st.write("👀 選擇標的觀看波段解析 (顯示於戰情室)")
+    st.write("👀 選擇標的觀看波段解析")
     selected_code = st.radio("自選股圖表選擇", st.session_state.watchlist, format_func=get_name)
 
 # ==================== 🧠 戰術分析核心引擎 ====================
@@ -97,7 +105,7 @@ def analyze_stock(code):
     tags = []
     is_buy_point = False
     
-    # 幕僚優化：防追高濾網 (過濾掉乖離過大的末升段)
+    # 防追高濾網 (過濾乖離過大的末升段)
     if c > high_10 and vol > (vol_ma10 * 2) and c > ma5 and bias_20 < 0.15:
         tags.append("🔥 安全放量突破 (起漲點)")
         is_buy_point = True
@@ -109,20 +117,18 @@ def analyze_stock(code):
     return {
         "代碼": code, "名稱": get_name(code), "現價": round(c, 2), 
         "訊號": ", ".join(tags) if tags else "量縮整理中", "強烈買訊": is_buy_point,
-        "raw_df": df # 供圖表繪製使用
+        "raw_df": df
     }
 
 # ==================== 🎯 主畫面：雙引擎模組 ====================
 st.title("⚡ TACTICAL COMMAND CENTER")
 st.caption(f"📅 系統更新時間: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}")
 
-tab1, tab2, tab3, tab4 = st.tabs(["🌅 1. 自選戰情室 (手機/PC)", "🏦 2. 兆豐 ETF 防禦", "🏆 3. 全市場掃描 (PC專用)", "🕵️ 4. 籌碼戰術板 (PC專用)"])
+tab1, tab2, tab3, tab4 = st.tabs(["🌅 1. 自選戰情室", "🏦 2. 兆豐 ETF 防禦", "🏆 3. 全市場掃描 (PC)", "🕵️ 4. 籌碼戰術板 (PC)"])
 
-# ----------------- 頁籤 1：自選戰情室 (結合清單與圖表) -----------------
+# ----------------- 頁籤 1：自選戰情室 -----------------
 with tab1:
     st.markdown("#### 盤前/盤中 突圍監控清單")
-    
-    # 採用多欄位排列提升空間利用率
     cols = st.columns(3)
     for idx, code in enumerate(st.session_state.watchlist):
         res = analyze_stock(code)
@@ -134,8 +140,6 @@ with tab1:
                     st.markdown(f"<div class='metric-card'><b>📊 {res['名稱']}</b> | 現價: {res['現價']}<br>狀態：{res['訊號']}</div>", unsafe_allow_html=True)
     
     st.divider()
-    
-    # 找回遺失的 Plotly 動態 K 線圖功能
     if selected_code:
         st.markdown(f"#### 📉 {get_name(selected_code)} 動態波段解析")
         res_data = analyze_stock(selected_code)
@@ -146,27 +150,42 @@ with tab1:
             fig.add_trace(go.Scatter(x=df.index, y=df['Close'].rolling(5).mean(), line=dict(color='yellow', width=1), name='5MA(週線)'))
             fig.add_trace(go.Scatter(x=df.index, y=df['Close'].rolling(20).mean(), line=dict(color='green', width=1), name='20MA(月線)'))
             fig.add_trace(go.Scatter(x=df.index, y=df['Close'].rolling(60).mean(), line=dict(color='magenta', width=1), name='60MA(季線)'))
-            
             fig.update_layout(template='plotly_dark', margin=dict(l=0, r=0, t=10, b=0), height=450, xaxis_rangeslider_visible=False)
             st.plotly_chart(fig, use_container_width=True)
 
-# ----------------- 頁籤 2：兆豐 ETF 防禦 -----------------
+# ----------------- 頁籤 2：兆豐 ETF 防禦 (分類過濾版) -----------------
 with tab2:
-    st.markdown("#### 台灣 ETF 位階區 (兆豐證券操作建議)")
+    st.markdown("#### 台灣 20 檔核心 ETF 位階監控")
+    
+    # 新增：ETF 分類下拉式選單過濾器
+    category_options = ["全部分類"] + list(set(ETF_DICT.values()))
+    selected_category = st.selectbox("🔍 選擇 ETF 戰略分類", category_options)
+    
     etf_res = []
     for code in ETF_LIST:
+        # 如果選擇的分類不是「全部」，且該 ETF 不屬於選擇的分類，則跳過
+        if selected_category != "全部分類" and ETF_DICT[code] != selected_category:
+            continue
+            
         df = fetch_data(code)
         if not df.empty:
             c, ma60 = df['Close'].iloc[-1], df['Close'].rolling(60).mean().iloc[-1]
             status = "🟢 季線上 (可定期定額)" if c >= ma60 else "🔴 跌破季線 (伺機單筆低接)"
-            etf_res.append({"代碼": get_name(code), "現價": round(c,2), "季線": round(ma60,2), "狀態": status})
+            etf_res.append({
+                "分類": ETF_DICT[code], "代碼": get_name(code), 
+                "現價": round(c,2), "季線": round(ma60,2), "狀態": status
+            })
+            
     if etf_res:
-        st.dataframe(pd.DataFrame(etf_res), use_container_width=True, hide_index=True)
+        etf_df = pd.DataFrame(etf_res).sort_values(by="分類")
+        st.dataframe(etf_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("該分類目前無資料。")
 
 # ----------------- 頁籤 3：全市場真實掃描 (PC專用) -----------------
 with tab3:
     st.markdown("#### 🏆 執行全市場策略掃描")
-    st.warning("⚠️ 此功能將向主機發出逾千次請求，建議僅於網路穩定的 PC 端執行。")
+    st.warning("⚠️ 僅限 PC 端執行：將掃描 1700 檔標的，預計耗時數分鐘。")
     if st.button("啟動全市場真實運算", use_container_width=True, type="primary"):
         progress_bar = st.progress(0)
         status_text = st.empty()
@@ -178,13 +197,10 @@ with tab3:
         for i, code in enumerate(codes_to_scan):
             status_text.text(f"幕僚運算中: {code} ({i+1}/{total_codes})")
             res = analyze_stock(code)
-            # 僅保留具備明確戰術訊號的標的
             if res and ("🔥" in res['訊號'] or "⚡" in res['訊號']):
                 real_scan_results.append({
-                    "代碼": res['代碼'],
-                    "名稱": res['名稱'],
-                    "現價": res['現價'],
-                    "觸發戰術": res['訊號']
+                    "代碼": res['代碼'], "名稱": res['名稱'], 
+                    "現價": res['現價'], "觸發戰術": res['訊號']
                 })
                 
             if i % 30 == 0: time.sleep(0.5) 
