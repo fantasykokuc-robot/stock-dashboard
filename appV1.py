@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import yfinance as yf
 import plotly.graph_objects as go
-import openai
 import requests
 import datetime
 import json
@@ -10,12 +9,8 @@ import os
 import time
 
 # ==================== 🛠️ 1. API 金鑰與系統設定 ====================
-OPENAI_API_KEY = "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"
-GEMINI_API_KEY = "AIzaSyBQAF9x5CCz6QJzuffbp3JjWhw5pUhFWYc"
-DEEPSEEK_API_KEY = "sk-1fd494c99f6c4601a3d6fb6e9b4b14ee"
+# 已移除 OpenAI, Gemini, DeepSeek 金鑰以策安全
 FINMIND_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjoiZmFudGFzeWtva3VjIiwiZW1haWwiOiJmYW50YXN5a29rdWNAZ21haWwuY29tIiwidG9rZW5fdmVyc2lvbiI6MH0.IOQSYqSUC6uaHIyXKf-OEDDYwLbT0D-Hw-H0rpKqD8Q"
-
-MAX_OUTPUT_TOKENS = 150 
 
 st.set_page_config(page_title="TACTICAL COMMAND | AI SYSTEM", page_icon="🛡️", layout="wide")
 
@@ -177,7 +172,7 @@ st.markdown(f"<h2>{res['全名']} <span style='color:{status_color}; font-size:1
 # --- 區塊一：主力意圖、劇本與能量 ---
 r1_c1, r1_c2, r1_c3 = st.columns([2, 1, 1])
 with r1_c1:
-    st.markdown("<div class='metric-card'><div class='title-text'>1️⃣ 6️⃣ AI 主力意圖與成本分析</div>", unsafe_allow_html=True)
+    st.markdown("<div class='metric-card'><div class='title-text'>1️⃣ 6️⃣ 主力意圖與成本分析</div>", unsafe_allow_html=True)
     fig_k = go.Figure(data=[go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='K線')])
     fig_k.add_trace(go.Scatter(x=df.index, y=df['MA5'], line=dict(color='#eab308', width=1), name='5MA'))
     fig_k.add_trace(go.Scatter(x=df.index, y=df['MA20'], line=dict(color='#60a5fa', width=1), name='20MA'))
@@ -191,7 +186,7 @@ with r1_c2:
         <p style='color:#10b981; margin-bottom:5px;'>↗ 突破上漲 ({up_prob}%)</p>
         <p style='color:#eab308; margin-bottom:5px;'>→ 震盪整理 ({side_prob}%)</p>
         <p style='color:#ef4444; margin-bottom:15px;'>↘ 轉弱下跌 ({down_prob}%)</p>
-        <div class='title-text' style='border-top: 1px solid #1f2937; padding-top: 10px;'>5️⃣ AI 多空能量條</div>
+        <div class='title-text' style='border-top: 1px solid #1f2937; padding-top: 10px;'>5️⃣ 多空能量條</div>
         <div style='display:flex; justify-content:space-between; font-size:0.8rem;'>
             <span style='color:#10b981'>多方 {bull_power}%</span><span style='color:#ef4444'>空方 {bear_power}%</span>
         </div>
@@ -230,114 +225,7 @@ with r2_c4:
     st.plotly_chart(fig_pred, use_container_width=True, theme=None)
     st.markdown("</div>", unsafe_allow_html=True)
 
-# ==================== 🤖 5. 三巨頭 AI 診斷 ====================
-st.markdown("---")
-st.markdown("### 🤖 三巨頭 AI 個股極簡風險評估")
-if st.button("🚀 啟動 AI 快速風險評估", type="primary", use_container_width=True):
-    
-    strict_prompt = f"""任務：評估台股 {res['全名']} (現價 {c_price}) 短線風險。
-    必須嚴格遵守以下格式，絕對不要有任何廢話或問候語：
-    
-    【風險係數】：(填入0%~100%)
-    【主要風險】：(嚴格限制20字以內說明)
-    
-    結尾加上：非投資建議。"""
-    
-    gemini_json_prompt = f"""任務：評估台股 {res['全名']} (現價 {c_price}) 短線風險。
-    請直接回傳合法的 JSON 格式，必須包含兩個 key：
-    "risk" (填入0%~100%之數字)
-    "reason" (嚴格限制20字內風險說明)
-    
-    絕對不要輸出 JSON 以外的任何文字、標記或括號。"""
-    
-    ai_col1, ai_col2, ai_col3 = st.columns(3)
-    
-    with ai_col1:
-        st.markdown("<div class='metric-card'><h4>🟢 ChatGPT (GPT-4o)</h4>", unsafe_allow_html=True)
-        try:
-            client = openai.OpenAI(api_key=OPENAI_API_KEY)
-            out = client.chat.completions.create(model="gpt-4o", messages=[{"role":"user","content":strict_prompt}], max_tokens=MAX_OUTPUT_TOKENS, temperature=0.2)
-            st.write(out.choices[0].message.content)
-        except Exception as e: st.error(f"OpenAI 錯誤: {str(e)}")
-        st.markdown("</div>", unsafe_allow_html=True)
-        
-    with ai_col2:
-        st.markdown("<div class='metric-card'><h4>🟠 DeepSeek (V3)</h4>", unsafe_allow_html=True)
-        try:
-            client = openai.OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
-            out = client.chat.completions.create(model="deepseek-chat", messages=[{"role":"user","content":strict_prompt}], max_tokens=MAX_OUTPUT_TOKENS, temperature=0.2)
-            st.write(out.choices[0].message.content)
-        except Exception as e: st.error(f"DeepSeek 錯誤: {str(e)}")
-        st.markdown("</div>", unsafe_allow_html=True)
-        
-    with ai_col3:
-        st.markdown("<div class='metric-card'><h4>🔵 Gemini (JSON 引擎強固版)</h4>", unsafe_allow_html=True)
-        if GEMINI_API_KEY:
-            valid_models = []
-            try:
-                models_url = f"https://generativelanguage.googleapis.com/v1beta/models?key={GEMINI_API_KEY}"
-                resp = requests.get(models_url, timeout=5)
-                if resp.status_code == 200:
-                    models_data = resp.json().get("models", [])
-                    valid_models = [m["name"] for m in models_data if "generateContent" in m.get("supportedGenerationMethods", [])]
-            except: pass
-            
-            if not valid_models:
-                valid_models = ["models/gemini-2.5-flash", "models/gemini-1.5-flash"]
-                
-            fallback_queue = []
-            for pref in ["2.5-flash", "1.5-flash"]:
-                for m in valid_models:
-                    if pref in m and m not in fallback_queue: fallback_queue.append(m)
-            if not fallback_queue and valid_models: fallback_queue.append(valid_models[0])
-                
-            success = False
-            last_error = ""
-            
-            for target_model in fallback_queue:
-                try:
-                    url = f"https://generativelanguage.googleapis.com/v1beta/{target_model}:generateContent?key={GEMINI_API_KEY}"
-                    payload = {
-                        "contents": [{"parts": [{"text": gemini_json_prompt}]}],
-                        "generationConfig": {"maxOutputTokens": 150, "temperature": 0.1},
-                        "safetySettings": [
-                            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-                            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-                            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-                            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
-                        ]
-                    }
-                    response = requests.post(url, headers={'Content-Type': 'application/json'}, json=payload, timeout=8)
-                    res_json = response.json()
-                    
-                    if response.status_code == 200 and "candidates" in res_json and len(res_json["candidates"]) > 0:
-                        raw_text = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
-                        raw_text = raw_text.replace('```json', '').replace('```', '').strip()
-                        
-                        try:
-                            data = json.loads(raw_text)
-                            st.write(f"【風險係數】：{data.get('risk', 'N/A')}\n\n【主要風險】：{data.get('reason', 'N/A')}\n\n非投資建議。")
-                        except json.JSONDecodeError:
-                            st.write(f"資料解析異常:\n{raw_text}")
-                            
-                        st.caption(f"✅ 成功連線: {target_model.split('/')[-1]}")
-                        success = True
-                        break 
-                    else:
-                        if 'error' in res_json: last_error = f"{res_json['error'].get('code')}: {res_json['error'].get('message')}"
-                        continue
-                except Exception as e:
-                    last_error = str(e)
-                    continue 
-            
-            if not success:
-                st.error("⚠️ 伺服器全線滿載或無可用模型。")
-                st.caption(f"除錯資訊: {last_error}")
-        else:
-            st.warning("未設定 Gemini API Key")
-        st.markdown("</div>", unsafe_allow_html=True)
-
-# ==================== 🌍 6. 擴充模組 (全市場掃描解禁 & 證交所偽裝) ====================
+# ==================== 🌍 5. 擴充模組 (全市場掃描解禁 & 證交所偽裝) ====================
 st.markdown("---")
 with st.expander("🌍 進階監控：市場掃描 / ETF / 實體籌碼數據"):
     sub1, sub2 = st.columns(2)
