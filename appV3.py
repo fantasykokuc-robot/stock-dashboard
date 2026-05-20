@@ -33,26 +33,23 @@ class SystemDiagnostics:
         # 1. 檢查必要檔案
         required_files = {
             "twse_listed_codes.csv": "股票代碼對照表",
-            "config/settings.json": "設定檔 (API Tokens)",
             "market_data.db": "SQLite 資料庫"
         }
         for file_path, desc in required_files.items():
             exists = os.path.exists(file_path)
             status = "✅ 找到" if exists else "❌ 缺失"
             results.append({"項目": desc, "路徑": file_path, "狀態": status})
-            if not exists and "config" in file_path:
-                os.makedirs("config", exist_ok=True)
-                with open(file_path, "w", encoding="utf-8") as f:
-                    json.dump({"FINMIND_TOKEN": "", "LINE_TOKENS": [], "TG_BOT_TOKEN": "", "TG_CHAT_IDS": []}, f)
         
-        # 2. 檢查網路與 API (僅檢查 token 是否為空)
-        token_status = "✅ 已設定" if CONFIG["FINMIND_TOKEN"] else "⚠️ 未設定 (FinMind)"
-        results.append({"項目": "FinMind Token", "路徑": "CONFIG", "狀態": token_status})
+        # 2. 檢查設定 (支援 Secrets)
+        has_token = CONFIG.get("FINMIND_TOKEN") and len(CONFIG["FINMIND_TOKEN"]) > 10
+        token_status = "✅ 已設定" if has_token else "⚠️ 未設定 (FinMind)"
+        results.append({"項目": "FinMind Token", "路徑": "CONFIG/Secrets", "狀態": token_status})
         
         return results
 
 # --- 獨立資料夾讀取邏輯 ---
 CONFIG_FILE = os.path.join("config", "settings.json")
+# 預設 Token (僅供本地快速測試)
 FINMIND_TOKEN_DEFAULT = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjoiZmFudGFzeWtva3VjIiwiZW1haWwiOiJmYW50YXN5a29rdWNAZ21haWwuY29tIiwidG9rZW5fdmVyc2lvbiI6MH0.IOQSYqSUC6uaHIyXKf-OEDDYwLbT0D-Hw-H0rpKqD8Q"
 
 CONFIG = {
@@ -62,13 +59,21 @@ CONFIG = {
     "TG_CHAT_IDS": []
 }
 
+# 優先順序：1. Streamlit Secrets (雲端) > 2. settings.json (本地) > 3. 預設值
 if os.path.exists(CONFIG_FILE):
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            user_config = json.load(f)
-            CONFIG.update(user_config)
-    except Exception as e:
-        logging.error(f"讀取設定檔失敗: {e}")
+            CONFIG.update(json.load(f))
+    except: pass
+
+# 整合 Streamlit Secrets
+try:
+    if "FINMIND_TOKEN" in st.secrets: CONFIG["FINMIND_TOKEN"] = st.secrets["FINMIND_TOKEN"]
+    if "LINE_TOKENS" in st.secrets: CONFIG["LINE_TOKENS"] = st.secrets["LINE_TOKENS"]
+    if "TG_BOT_TOKEN" in st.secrets: CONFIG["TG_BOT_TOKEN"] = st.secrets["TG_BOT_TOKEN"]
+    if "TG_CHAT_IDS" in st.secrets: CONFIG["TG_CHAT_IDS"] = st.secrets["TG_CHAT_IDS"]
+except:
+    pass
 
 st.set_page_config(page_title="TACTICAL COMMAND | PRO FUSION", page_icon="🛡️", layout="wide")
 
@@ -223,10 +228,18 @@ class DataEngine:
     # 🛡️ 整合 Telegram 與 LINE 發送引擎
     @staticmethod
     def broadcast_message(message):
-        # 1. 發送 LINE
-        for token in CONFIG["LINE_TOKENS"]:
-            try: requests.post("https://notify-api.line.me/api/notify", headers={"Authorization": f"Bearer {token}"}, data={"message": message}, timeout=5)
-            except: pass
+        # 1. 發送 LINE (支援多組 Token)
+        line_tokens = CONFIG.get("LINE_TOKENS", [])
+        for token in line_tokens:
+            try:
+                requests.post(
+                    "https://notify-api.line.me/api/notify",
+                    headers={"Authorization": f"Bearer {token}"},
+                    data={"message": message},
+                    timeout=10
+                )
+            except Exception as e:
+                logging.error(f"LINE 推播失敗: {e}")
             
         # 2. 發送 Telegram
         tg_token = CONFIG.get("TG_BOT_TOKEN")
@@ -560,6 +573,19 @@ def main():
                 
         st.markdown("---")
         auto_monitor = st.toggle("🚀 啟動循環監控", value=False)
+        if auto_monitor:
+            st.success("✅ 循環監控已開啟 (每 5 分鐘掃描)")
+
+        with st.expander("☁️ 雲端同步與備份 (解決重啟消失)", expanded=False):
+            st.caption("Streamlit Cloud 重啟後資料會還原。請將自選名單複製存檔，或在此貼回。")
+            current_watchlist_str = ",".join(st.session_state.watchlist)
+            new_watchlist_str = st.text_area("自選股代碼 (逗號隔開)", value=current_watchlist_str, help="例如: 2330,2317,2454")
+            if st.button("🔄 同步名單", use_container_width=True):
+                codes = [c.strip().zfill(4) for c in new_watchlist_str.split(",") if c.strip()]
+                st.session_state.watchlist = codes
+                with open(WATCHLIST_FILE, 'w') as f: json.dump(st.session_state.watchlist, f)
+                st.success("同步成功！")
+                st.rerun()
 
     if selected_code:
         render_dashboard(selected_code, stock_dict)

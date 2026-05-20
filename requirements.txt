@@ -2,3 +2,6 @@ streamlit
 pandas
 yfinance
 plotly
+requests
+streamlit-autorefresh
+sqlite3
