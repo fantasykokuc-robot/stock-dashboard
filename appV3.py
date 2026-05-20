@@ -19,21 +19,59 @@ try:
 except ImportError:
     HAS_AUTOREFRESH = False
 
+import threading
+
 # ==================== ⚙️ 1. 系統配置與日誌 ====================
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+DB_LOCK = threading.Lock()
 
+class SystemDiagnostics:
+    """系統自我檢查模組[cite: 4]"""
+    @staticmethod
+    def run_checks():
+        results = []
+        # 1. 檢查必要檔案
+        required_files = {
+            "twse_listed_codes.csv": "股票代碼對照表",
+            "config/settings.json": "設定檔 (API Tokens)",
+            "market_data.db": "SQLite 資料庫"
+        }
+        for file_path, desc in required_files.items():
+            exists = os.path.exists(file_path)
+            status = "✅ 找到" if exists else "❌ 缺失"
+            results.append({"項目": desc, "路徑": file_path, "狀態": status})
+            if not exists and "config" in file_path:
+                os.makedirs("config", exist_ok=True)
+                with open(file_path, "w", encoding="utf-8") as f:
+                    json.dump({"FINMIND_TOKEN": "", "LINE_TOKENS": [], "TG_BOT_TOKEN": "", "TG_CHAT_IDS": []}, f)
+        
+        # 2. 檢查網路與 API (僅檢查 token 是否為空)
+        token_status = "✅ 已設定" if CONFIG["FINMIND_TOKEN"] else "⚠️ 未設定 (FinMind)"
+        results.append({"項目": "FinMind Token", "路徑": "CONFIG", "狀態": token_status})
+        
+        return results
+
+# --- 獨立資料夾讀取邏輯 ---
+CONFIG_FILE = os.path.join("config", "settings.json")
 FINMIND_TOKEN_DEFAULT = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjoiZmFudGFzeWtva3VjIiwiZW1haWwiOiJmYW50YXN5a29rdWNAZ21haWwuY29tIiwidG9rZW5fdmVyc2lvbiI6MH0.IOQSYqSUC6uaHIyXKf-OEDDYwLbT0D-Hw-H0rpKqD8Q"
-try:
-    CONFIG = {
-        "FINMIND_TOKEN": st.secrets.get("FINMIND_TOKEN", FINMIND_TOKEN_DEFAULT),
-        "LINE_TOKENS": st.secrets.get("LINE_TOKENS", []),
-    }
-except Exception:
-    CONFIG = {"FINMIND_TOKEN": FINMIND_TOKEN_DEFAULT, "LINE_TOKENS": []}
+
+CONFIG = {
+    "FINMIND_TOKEN": FINMIND_TOKEN_DEFAULT,
+    "LINE_TOKENS": [],
+    "TG_BOT_TOKEN": "",
+    "TG_CHAT_IDS": []
+}
+
+if os.path.exists(CONFIG_FILE):
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            user_config = json.load(f)
+            CONFIG.update(user_config)
+    except Exception as e:
+        logging.error(f"讀取設定檔失敗: {e}")
 
 st.set_page_config(page_title="TACTICAL COMMAND | PRO FUSION", page_icon="🛡️", layout="wide")
 
-# 🛡️ 深度修復：加入強制白字的 CSS，解決黑底黑字問題
 st.markdown("""
     <style>
     .stApp { background: linear-gradient(135deg, #0b101e 0%, #1a1f2e 50%, #0f172a 100%); color: #E0E0E0; font-family: 'Microsoft JhengHei', sans-serif; }
@@ -42,21 +80,14 @@ st.markdown("""
     .title-text { color: #60a5fa; font-weight: bold; border-bottom: 2px solid #1f2937; padding-bottom: 10px; margin-bottom: 20px; font-size: 1.2rem; }
     .score-badge { font-size: 3rem; font-weight: bold; text-align: center; padding: 15px; border-radius: 15px; text-shadow: 0 0 10px rgba(96, 165, 250, 0.5); }
     .signal-item { padding: 8px 12px; margin: 5px 0; background: rgba(31, 41, 55, 0.5); border-radius: 6px; border-left: 3px solid #60a5fa; font-size: 0.95rem; }
-    
-    /* 強制輸入框、下拉選單、表格文字為白色 */
-    div[data-baseweb="input"] input, div[data-baseweb="select"] > div {
-        background-color: #1f2937 !important;
-        color: #ffffff !important;
-        -webkit-text-fill-color: #ffffff !important;
-    }
+    div[data-baseweb="input"] input, div[data-baseweb="select"] > div { background-color: #1f2937 !important; color: #ffffff !important; -webkit-text-fill-color: #ffffff !important; }
     .stDataFrame, table { color: #ffffff !important; }
     </style>
 """, unsafe_allow_html=True)
 
-# 建立 SQLite 檔案快取連線
 DB_CONN = sqlite3.connect("market_data.db", check_same_thread=False)
 
-# ==================== 💾 2. 數據引擎 (終極防呆版) ====================
+# ==================== 💾 2. 數據引擎 ====================
 class DataEngine:
     @staticmethod
     @st.cache_data(ttl=3600)
@@ -75,7 +106,6 @@ class DataEngine:
         table_name = f"price_{stock_id}"
         required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
         
-        # 🛡️ 1. 讀取 SQLite，若資料損壞則強制重新抓取
         try:
             df = pd.read_sql(f"SELECT * FROM {table_name}", DB_CONN, index_col="Date", parse_dates=["Date"])
             if not df.empty and all(col in df.columns for col in required_cols):
@@ -86,7 +116,6 @@ class DataEngine:
         df = pd.DataFrame()
         start_date = (datetime.datetime.now() - datetime.timedelta(days=250)).strftime("%Y-%m-%d")
 
-        # 🛡️ 2. FinMind 抓取
         try:
             url = "https://api.finmindtrade.com/api/v4/data"
             resp = requests.get(url, params={"dataset": "TaiwanStockPrice", "data_id": stock_id, "start_date": start_date, "token": CONFIG["FINMIND_TOKEN"]}, timeout=8)
@@ -100,29 +129,25 @@ class DataEngine:
                     df.set_index('Date', inplace=True)
         except: pass
 
-        # 🛡️ 3. 深度修復：yfinance MultiIndex 扁平化，解決 3481 抓不到的問題
         if df.empty or 'Close' not in df.columns:
             for suffix in ['.TW', '.TWO']:
                 try:
                     df_yf = yf.download(f"{stock_id}{suffix}", period="1y", progress=False)
                     if not df_yf.empty and len(df_yf) > 5:
-                        # 處理 yfinance 新版的 MultiIndex 欄位問題
                         if isinstance(df_yf.columns, pd.MultiIndex):
                             df_yf.columns = df_yf.columns.get_level_values(0)
-                        
                         df_yf.index = df_yf.index.tz_localize(None)
                         df = df_yf
                         break
                 except: continue
 
         if df.empty: return pd.DataFrame()
-        
-        # 再次確認欄位完整性
         if not all(col in df.columns for col in required_cols): return pd.DataFrame()
             
         df = df[required_cols].astype(float).ffill().dropna(subset=['Close'])
-        
-        try: df.to_sql(table_name, DB_CONN, if_exists="replace", index=True)
+        try:
+            with DB_LOCK:
+                df.to_sql(table_name, DB_CONN, if_exists="replace", index=True)
         except: pass
         
         return DataEngine._precompute_indicators(df)
@@ -135,8 +160,7 @@ class DataEngine:
             url = "https://api.finmindtrade.com/api/v4/data"
             resp = requests.get(url, params={"dataset": "TaiwanStockInstitutionalInvestorsBuySell", "data_id": stock_id, "start_date": start_date, "token": CONFIG["FINMIND_TOKEN"]}, timeout=5)
             if resp.status_code == 200 and 'data' in resp.json() and len(resp.json()['data']) > 0:
-                df = pd.DataFrame(resp.json()['data'])
-                return df
+                return pd.DataFrame(resp.json()['data'])
         except: pass
         return pd.DataFrame()
 
@@ -148,23 +172,19 @@ class DataEngine:
             url = "https://api.finmindtrade.com/api/v4/data"
             resp = requests.get(url, params={"dataset": "TaiwanStockMonthRevenue", "data_id": stock_id, "start_date": start_date, "token": CONFIG["FINMIND_TOKEN"]}, timeout=5)
             if resp.status_code == 200 and 'data' in resp.json() and len(resp.json()['data']) > 0:
-                df = pd.DataFrame(resp.json()['data'])
-                return df
+                return pd.DataFrame(resp.json()['data'])
         except: pass
         return pd.DataFrame()
 
     @staticmethod
     def fetch_global_news():
-        """獲取國外重大財經新聞 (Google News RSS)"""
         url = "https://news.google.com/rss/search?q=%E5%9C%8B%E9%9A%9B%E8%B2%A1%E7%B6%93&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
         try:
             resp = requests.get(url, timeout=5)
             root = ET.fromstring(resp.content)
             news_list = []
-            for item in root.findall('.//item')[:5]: # 抓取前 5 則
-                title = item.find('title').text
-                link = item.find('link').text
-                news_list.append({"title": title, "link": link})
+            for item in root.findall('.//item')[:5]:
+                news_list.append({"title": item.find('title').text, "link": item.find('link').text})
             return news_list
         except: return []
 
@@ -174,19 +194,63 @@ class DataEngine:
         df['MA20'] = df['Close'].rolling(20).mean()
         df['MA60'] = df['Close'].rolling(60).mean()
         df['VolMA5'] = df['Volume'].rolling(5).mean()
+        
+        # RSI (14) - 技術指標優化[cite: 9]
+        delta = df['Close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        df['RSI'] = 100 - (100 / (1 + rs))
+
+        # 波動率 ATR (14)
+        high_low = df['High'] - df['Low']
+        high_close = (df['High'] - df['Close'].shift()).abs()
+        low_close = (df['Low'] - df['Close'].shift()).abs()
+        ranges = pd.concat([high_low, high_close, low_close], axis=1)
+        true_range = ranges.max(axis=1)
+        df['ATR'] = true_range.rolling(14).mean()
         return df
+
+    @staticmethod
+    @st.cache_data(ttl=3600)
+    def fetch_index_data():
+        try:
+            df = yf.download("^TWII", period="1y", progress=False)
+            if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+            return df['Close'].ffill()
+        except: return pd.Series()
+
+    # 🛡️ 整合 Telegram 與 LINE 發送引擎
+    @staticmethod
+    def broadcast_message(message):
+        # 1. 發送 LINE
+        for token in CONFIG["LINE_TOKENS"]:
+            try: requests.post("https://notify-api.line.me/api/notify", headers={"Authorization": f"Bearer {token}"}, data={"message": message}, timeout=5)
+            except: pass
+            
+        # 2. 發送 Telegram
+        tg_token = CONFIG.get("TG_BOT_TOKEN")
+        if tg_token:
+            for chat_id in CONFIG.get("TG_CHAT_IDS", []):
+                try:
+                    tg_url = f"https://api.telegram.org/bot{tg_token}/sendMessage"
+                    requests.post(tg_url, json={"chat_id": str(chat_id), "text": message}, timeout=5)
+                except Exception as e:
+                    logging.error(f"Telegram 推播失敗: {e}")
 
 # ==================== 📈 3. 策略與指標運算引擎 ====================
 class StrategyEngine:
     @staticmethod
     def analyze_metrics(code, df_price, df_chips, df_fund, source="系統"):
-        if df_price.empty or len(df_price) < 15: return None
+        if df_price.empty or len(df_price) < 20: return None
         
         def safe_get(val, default): return default if pd.isna(val) else val
         
         latest = df_price.iloc[-1]
         c_price = latest['Close']
         c_vol = latest['Volume']
+        rsi = latest.get('RSI', 50)
+        ma5 = safe_get(latest.get('MA5'), c_price)
         ma20 = safe_get(latest.get('MA20'), c_price)
         ma60 = safe_get(latest.get('MA60'), c_price)
         vol_ma5 = safe_get(latest.get('VolMA5'), c_vol)
@@ -194,24 +258,42 @@ class StrategyEngine:
         scores = {'tech': 0, 'chips': 0, 'fund': 0}
         signals = []
         
-        if c_price > ma60 and ma20 > ma60: scores['tech'] += 15; signals.append("✅ 完美多頭排列")
-        elif c_price > ma20: scores['tech'] += 15; signals.append("🟡 價格站上月線")
-        if c_vol > vol_ma5 * 1.5: scores['tech'] += 15; signals.append("💥 量能爆發")
+        # --- 1. 技術面優化 ---
+        if c_price > ma60 and ma20 > ma60: scores['tech'] += 5; signals.append("✅ 完美多頭排列")
+        if c_price > ma20: scores['tech'] += 5; signals.append("🟡 價格站上月線")
+        if c_vol > vol_ma5 * 1.5: scores['tech'] += 10; signals.append("💥 量能爆發")
+        if 40 < rsi < 70: scores['tech'] += 5; signals.append("🟢 RSI 健康 (未過熱)")
+        elif rsi >= 75: signals.append("⚠️ RSI 嚴重過熱")
+        
+        # 相對強度 RS (20日)
+        df_index = DataEngine.fetch_index_data()
+        if not df_index.empty:
+            stock_ret = (c_price - df_price['Close'].iloc[-20]) / df_price['Close'].iloc[-20] if len(df_price) >= 20 else 0
+            idx_ret = (df_index.iloc[-1] - df_index.iloc[-20]) / df_index.iloc[-20] if len(df_index) >= 20 else 0
+            if stock_ret > idx_ret:
+                scores['tech'] += 5; signals.append("📈 強於大盤 (RS)")
             
+        # --- 2. 籌碼面優化 (連買邏輯) ---
         if not df_chips.empty and 'name' in df_chips.columns:
             df_foreign = df_chips[df_chips['name'].str.contains('外資', na=False)]
             df_trust = df_chips[df_chips['name'].str.contains('投信', na=False)]
-            f_buy = df_foreign.tail(3)['buy'].sum() - df_foreign.tail(3)['sell'].sum() if not df_foreign.empty else 0
-            t_buy = df_trust.tail(3)['buy'].sum() - df_trust.tail(3)['sell'].sum() if not df_trust.empty else 0
-            if f_buy > 0: scores['chips'] += 20; signals.append(f"🌍 外資偏多")
-            if t_buy > 0: scores['chips'] += 20; signals.append(f"🏦 投信偏多")
-        else: scores['chips'] = 20
+            
+            f_trend = (df_foreign.tail(3)['buy'].values > df_foreign.tail(3)['sell'].values).all() if len(df_foreign) >= 3 else False
+            t_trend = (df_trust.tail(3)['buy'].values > df_trust.tail(3)['sell'].values).all() if len(df_trust) >= 3 else False
+            
+            if f_trend: scores['chips'] += 20; signals.append("🌍 外資連續 3 日吸籌")
+            elif (df_foreign.tail(1)['buy'].sum() > df_foreign.tail(1)['sell'].sum()): scores['chips'] += 10; signals.append("🌍 外資今日買超")
+            
+            if t_trend: scores['chips'] += 20; signals.append("🏦 投信連續 3 日佈局")
+            elif (df_trust.tail(1)['buy'].sum() > df_trust.tail(1)['sell'].sum()): scores['chips'] += 10; signals.append("🏦 投信今日買超")
+        else: scores['chips'] = 15
 
+        # --- 3. 基本面優化 ---
         if not df_fund.empty and 'revenue_year_on_year_growth_rate' in df_fund.columns:
             latest_yoy = df_fund['revenue_year_on_year_growth_rate'].iloc[-1]
-            if latest_yoy > 10: scores['fund'] += 30; signals.append(f"📈 營收高成長")
+            if latest_yoy > 20: scores['fund'] += 30; signals.append(f"🚀 營收爆發式成長 ({latest_yoy}%)")
             elif latest_yoy > 0: scores['fund'] += 15; signals.append(f"穩 營收正成長")
-        else: scores['fund'] = 15
+        else: scores['fund'] = 10
 
         total_score = sum(scores.values())
         if total_score >= 80: status, status_color = "🔥🔥 強力買入", "#34d399"
@@ -219,6 +301,18 @@ class StrategyEngine:
         elif total_score >= 45: status, status_color = "👀 觀察中", "#fbbf24"
         else: status, status_color = "⏸️ 觀望", "#9ca3af"
         
+        # --- 4. 終極買點判斷 ---
+        high_10 = df_price['High'].iloc[-11:-1].max() if len(df_price) >= 11 else df_price['High'].max()
+        is_breakout = (c_price > high_10) and (c_vol > vol_ma5 * 1.8) and (c_price > ma5) and (rsi < 75)
+        is_buy = is_breakout and (total_score >= 70)
+        
+        if is_buy:
+            today = datetime.date.today().isoformat()
+            if st.session_state.get('notified', {}).get(code) != today:
+                msg = f"\n🎯 【{source}】精選買點通報\n標的：{code}\n現價：{round(c_price, 2)}\n評分：{total_score}/100\n戰術：🛡️ 高分放量突破"
+                DataEngine.broadcast_message(msg)
+                st.session_state.notified[code] = today
+
         high_5, low_5 = df_price['High'].tail(5).max(), df_price['Low'].tail(5).min()
         bull_power = max(10, min(90, int(((c_price - low_5) / (high_5 - low_5)) * 100) if high_5 != low_5 else 50))
         risk_score = min(int((c_vol / vol_ma5) * 35), 95) if vol_ma5 > 0 else 50
@@ -244,19 +338,94 @@ class StrategyEngine:
             "r_main": min(max(10 - int(risk_score/10), 2), 9),
             "r_inst": min(max(int(bias_20 * 50) + 6, 2), 9),
             "r_conc": min(max(int(vol_ma5 / df_price['Volume'].mean() * 5) + 3, 3), 9) if df_price['Volume'].mean() > 0 else 5,
-            "vp_labels": vp_labels, "vp_values": vp_values, "df": df_price, "is_buy": total_score >= 65
+            "vp_labels": vp_labels, "vp_values": vp_values, "df": df_price, "is_buy": is_buy
         }
 
-# ==================== 🎨 4. 單頁視覺儀表板 ====================
+# ==================== 🏗️ 4. ETF 與產業分析引擎 ====================
+class ETFEngine:
+    # 產業翻譯對照表
+    INDUSTRY_MAP = {
+        "Semiconductors": "半導體",
+        "Electronic Components": "電子零組件",
+        "Computers & Peripheral Equipment": "電腦及週邊設備",
+        "Communication & Networking": "通信網路",
+        "Optoelectronics": "光電",
+        "Other Electronics": "其他電子",
+        "Electronic Products Distribution": "電子通路",
+        "Information Service": "資訊服務",
+        "Semiconductor Equipment & Materials": "半導體設備",
+        "Banks": "銀行業",
+        "Financial Services": "金融服務",
+        "Insurance": "保險業",
+        "Shipping": "航運",
+        "Steel": "鋼鐵",
+        "Chemicals": "化學",
+        "Plastics": "塑膠",
+        "Textiles": "紡織",
+        "Food": "食品",
+        "Automobiles": "汽車",
+        "Retail": "零售",
+        "Real Estate": "房地產",
+        "Construction": "建材營造",
+        "Trading & Consumer Goods": "貿易百貨",
+        "Other": "其他"
+    }
+
+    @staticmethod
+    def fetch_stock_industry(stock_id):
+        """獲取股票所屬產業分類 (並翻譯為中文)"""
+        stock_id = str(stock_id).strip().zfill(4)
+        try:
+            ticker = yf.Ticker(f"{stock_id}.TW")
+            info = ticker.info
+            industry_en = info.get('industryDisp', info.get('industry', 'Other'))
+            return ETFEngine.INDUSTRY_MAP.get(industry_en, industry_en)
+        except:
+            return "電子/其他"
+
+    @staticmethod
+    def get_etf_holdings_mock(etf_id):
+        """模擬熱門主動式/主題式 ETF 持股"""
+        holdings = {
+            "0050": ["2330", "2317", "2454", "2308", "2881", "2303", "2882", "3711", "2412", "2891"],
+            "0056": ["2317", "2382", "2357", "3231", "2449", "2301", "3034", "3037", "2379", "6239"],
+            "00878": ["2357", "2382", "3231", "2301", "2891", "2881", "2324", "2409", "2882", "2356"],
+            "00919": ["2303", "2603", "2379", "3034", "2454", "2377", "2385", "6176", "3005", "5483"],
+            "00929": ["2454", "2379", "3034", "2385", "3037", "2408", "2344", "3231", "2317", "2303"],
+            "ACTIVE_AI": ["2330", "2317", "2382", "3231", "6669", "2357", "3017", "2376", "2454", "3515"]
+        }
+        return holdings.get(str(etf_id), [])
+
+    @staticmethod
+    def analyze_etf_sector_dist(etf_id):
+        codes = ETFEngine.get_etf_holdings_mock(etf_id)
+        if not codes: return None
+        
+        dist = {}
+        stock_details = []
+        for code in codes:
+            industry = ETFEngine.fetch_stock_industry(code)
+            dist[industry] = dist.get(industry, 0) + 1
+            stock_details.append({"代碼": code, "產業": industry})
+        
+        return {"dist": dist, "details": stock_details}
+
+# ==================== 🎨 5. 單頁視覺儀表板 ====================
 def render_dashboard(code, stock_dict):
-    with st.spinner(f"🔄 分析 {code} 三因子戰情數據中..."):
+    with st.sidebar:
+        with st.expander("🛠️ 系統診斷自檢", expanded=False):
+            diag_results = SystemDiagnostics.run_checks()
+            st.table(pd.DataFrame(diag_results))
+            if any("❌" in r["狀態"] for r in diag_results):
+                st.error("⚠️ 偵測到關鍵檔案缺失，請確認路徑。")
+    with st.spinner(f"🔄 分析 {code} 戰情數據中..."):
         df_price = DataEngine.fetch_stock_data(code)
         df_chips = DataEngine.fetch_chips_data(code)
         df_fund = DataEngine.fetch_fundamental_data(code)
         metrics = StrategyEngine.analyze_metrics(code, df_price, df_chips, df_fund)
     
     if not metrics:
-        st.error(f"⚠️ 無法獲取 {code} 的完整數據。可能為剛上市冷門股或 API 限制。")
+        st.error(f"⚠️ 無法獲取 {code} 的完整數據。請由左側切換標的。")
         return
 
     df = metrics['df']
@@ -363,6 +532,7 @@ def render_dashboard(code, stock_dict):
 # ==================== 🚀 5. 主程式與擴充模組 ====================
 def main():
     stock_dict = DataEngine.load_stock_dict()
+    if 'notified' not in st.session_state: st.session_state.notified = {}
     
     WATCHLIST_FILE, ETF_FILE = 'watchlist.json', 'etf_list.json'
     if 'watchlist' not in st.session_state:
@@ -394,11 +564,42 @@ def main():
     if selected_code:
         render_dashboard(selected_code, stock_dict)
 
-    # ---------------- 擴充模組：ETF 自訂、新聞、多執行緒掃描 ----------------
+    st.markdown("---")
+    
+    # --- 新增：主動式 ETF 與產業分析分頁 ---
+    st.subheader("🕵️ 主動式 ETF 與產業深度解析")
+    etf_tab1, etf_tab2 = st.tabs(["📊 ETF 成分產業分佈", "🔍 產業連動掃描"])
+    
+    with etf_tab1:
+        c1, c2 = st.columns([1, 2])
+        with c1:
+            target_etf = st.selectbox("選擇監測 ETF", ["0050", "0056", "00878", "00919", "00929", "ACTIVE_AI"])
+            if st.button("🚀 啟動成分解析", use_container_width=True):
+                with st.spinner("正在解析成分股產業分類..."):
+                    res = ETFEngine.analyze_etf_sector_dist(target_etf)
+                    if res:
+                        st.session_state.etf_analysis = res
+        
+        if 'etf_analysis' in st.session_state:
+            res = st.session_state.etf_analysis
+            with c2:
+                fig_pie = go.Figure(data=[go.Pie(labels=list(res['dist'].keys()), values=list(res['dist'].values()), hole=.3)])
+                fig_pie.update_layout(template='plotly_dark', title=f"🎯 {target_etf} 持股產業權重分佈", height=400, margin=dict(t=50, b=20, l=20, r=20))
+                st.plotly_chart(fig_pie, use_container_width=True)
+            
+            st.markdown("#### 📄 詳細成分清單")
+            st.dataframe(pd.DataFrame(res['details']), use_container_width=True)
+
+    with etf_tab2:
+        st.info("💡 此功能將根據選定 ETF 的主要持股產業，自動掃描全市場中同產業且「三因子模型」達標的潛在飆股。")
+        if 'etf_analysis' in st.session_state:
+            top_sectors = sorted(st.session_state.etf_analysis['dist'].items(), key=lambda x: x[1], reverse=True)[:2]
+            st.write(f"當前重點關注產業：**{', '.join([s[0] for s in top_sectors])}**")
+            if st.button("🔍 執行產業連動篩選"):
+                st.warning("功能開發中：將結合全市場掃描引擎進行過濾。")
+
     st.markdown("---")
     with st.expander("🌍 進階監控面板：多執行緒掃描 / 自訂 ETF / 國際新聞 / 實體籌碼", expanded=False):
-        
-        # 上半部：ETF 與 新聞
         top_c1, top_c2 = st.columns([1, 1])
         with top_c1:
             st.subheader("🏦 核心 ETF 監控 (可自訂)")
@@ -439,8 +640,6 @@ def main():
                     st.info("目前無法獲取即時新聞。")
 
         st.markdown("---")
-        
-        # 下半部：籌碼與全市場掃描
         bot_c1, bot_c2 = st.columns([1, 1.2])
         with bot_c1:
             st.subheader("📊 盤後實體籌碼數據 (證交所)")
@@ -463,7 +662,6 @@ def main():
             if st.button("🚀 啟動戰術掃描", type="primary", use_container_width=True):
                 all_codes = list(stock_dict.keys())
                 if not all_codes: all_codes = ["2330", "2317", "2454", "2308", "2881", "2603", "3481"]
-                
                 scan_limit = len(all_codes) if max_scan == "全清單" else max_scan
                 codes_to_scan = all_codes[:scan_limit]
                 
@@ -474,11 +672,10 @@ def main():
                 completed = 0
                 
                 def scan_task(c):
-                    # 💡 漏斗過濾機制：先看技術面，不及格直接剔除，省下呼叫籌碼與基本面 API 的時間
                     df_s = DataEngine.fetch_stock_data(c)
                     if df_s.empty or len(df_s) < 20: return None
                     c_price, ma20 = df_s['Close'].iloc[-1], df_s['MA20'].iloc[-1]
-                    if c_price < ma20: return None # 均線空頭直接過濾
+                    if c_price < ma20: return None
                     
                     df_chips = DataEngine.fetch_chips_data(c)
                     df_fund = DataEngine.fetch_fundamental_data(c)
@@ -499,7 +696,7 @@ def main():
                             elapsed = time.time() - start_time
                             eta = (elapsed / completed) * (scan_limit - completed)
                             p_bar.progress(completed / scan_limit)
-                            s_text.markdown(f"**⏳ 正在掃描 ({completed}/{scan_limit}) | 已耗時: {elapsed:.1f}s | 預估剩餘: {eta:.1f}s | 尋獲標的: {len(found)}**")
+                            s_text.markdown(f"**⏳ 正在掃描 ({completed}/{scan_limit}) | 耗時: {elapsed:.1f}s | 剩餘: {eta:.1f}s | 尋獲標的: {len(found)}**")
                 
                 s_text.markdown(f"✅ **掃描完成！共耗時 {time.time()-start_time:.1f} 秒。**")
                 if found:
