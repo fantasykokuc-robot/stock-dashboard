@@ -1,0 +1,5 @@
+建議將您的系統演進劃分為「工程穩固」與「策略迭代」雙軌並行：階段軟體工程重點 (Tech)量化策略重點 (Quant)
+Phase 0.5 (本週)解決 API Rate Limit：實作資料庫快取 (SQLite)，避免掃描時被 Ban IP。完善現有三因子，設定明確的分數權重（例：籌碼40%、技術30%、基本30%）
+Phase 1 (下個月)後端分離：導入 FastAPI 負責運算，Streamlit 只做 UI 展示。實作 GitHub Actions CI/CD。優化止損：加入 ATR 動態移動止損，保護獲利。加入相對強弱 (RS) 濾網。
+Phase 2 (下一季)非同步掃描：導入 Redis Queue 處理全市場掃描，實現背景運算與 UI 進度條。因子進階：開發 LLM 財報/新聞事件萃取模組；計算投信持股成本線。
+Phase 3 (未來)大數據與串流：導入 PostgreSQL，使用 WebSocket 即時推送買賣信號至前端與 LINE。機器學習：使用 XGBoost 或 LightGBM 將多因子非線性組合，動態預測次日勝率。
