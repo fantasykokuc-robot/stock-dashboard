@@ -80,11 +80,16 @@ st.set_page_config(page_title="TACTICAL COMMAND | PRO FUSION", page_icon="ðŸ›¡ï¸
 st.markdown("""
     <style>
     .stApp { background: linear-gradient(135deg, #0b101e 0%, #1a1f2e 50%, #0f172a 100%); color: #E0E0E0; font-family: 'Microsoft JhengHei', sans-serif; }
-    .metric-card { background: linear-gradient(135deg, #121826 0%, #1a1f2e 100%); border: 1px solid #1f2937; border-radius: 12px; padding: 20px; margin-bottom: 15px; box-shadow: 0 4px 12px rgba(0,0,0,0.4); height: 100%; transition: all 0.3s ease;}
+    .metric-card { background: linear-gradient(135deg, #121826 0%, #1a1f2e 100%); border: 1px solid #1f2937; border-radius: 12px; padding: 15px; margin-bottom: 10px; box-shadow: 0 4px 12px rgba(0,0,0,0.4); transition: all 0.3s ease;}
+    @media (max-width: 768px) {
+        .metric-card { padding: 10px; margin-bottom: 8px; }
+        .score-badge { font-size: 2.2rem !important; }
+        h2 { font-size: 1.2rem !important; }
+    }
     .metric-card:hover { transform: translateY(-2px); box-shadow: 0 6px 16px rgba(0,0,0,0.6); }
-    .title-text { color: #60a5fa; font-weight: bold; border-bottom: 2px solid #1f2937; padding-bottom: 10px; margin-bottom: 20px; font-size: 1.2rem; }
-    .score-badge { font-size: 3rem; font-weight: bold; text-align: center; padding: 15px; border-radius: 15px; text-shadow: 0 0 10px rgba(96, 165, 250, 0.5); }
-    .signal-item { padding: 8px 12px; margin: 5px 0; background: rgba(31, 41, 55, 0.5); border-radius: 6px; border-left: 3px solid #60a5fa; font-size: 0.95rem; }
+    .title-text { color: #60a5fa; font-weight: bold; border-bottom: 2px solid #1f2937; padding-bottom: 8px; margin-bottom: 15px; font-size: 1.1rem; }
+    .score-badge { font-size: 3rem; font-weight: bold; text-align: center; padding: 10px; border-radius: 15px; text-shadow: 0 0 10px rgba(96, 165, 250, 0.5); }
+    .signal-item { padding: 6px 10px; margin: 4px 0; background: rgba(31, 41, 55, 0.5); border-radius: 6px; border-left: 3px solid #60a5fa; font-size: 0.85rem; }
     div[data-baseweb="input"] input, div[data-baseweb="select"] > div { background-color: #1f2937 !important; color: #ffffff !important; -webkit-text-fill-color: #ffffff !important; }
     .stDataFrame, table { color: #ffffff !important; }
     </style>
