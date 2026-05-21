@@ -95,32 +95,70 @@ DB_CONN = sqlite3.connect("market_data.db", check_same_thread=False)
 # ==================== 💾 2. 數據引擎 ====================
 class DataEngine:
     @staticmethod
+    def update_stock_list_if_needed():
+        file_path = 'twse_listed_codes.csv'
+        needs_update = True
+        
+        # 檢查檔案是否超過 7 天
+        if os.path.exists(file_path):
+            file_mtime = datetime.datetime.fromtimestamp(os.path.getmtime(file_path))
+            if (datetime.datetime.now() - file_mtime).days < 7:
+                needs_update = False
+                
+        if needs_update:
+            try:
+                logging.info("開始自動更新股票代碼清單...")
+                url = "https://api.finmindtrade.com/api/v4/data"
+                resp = requests.get(url, params={"dataset": "TaiwanStockInfo", "token": CONFIG["FINMIND_TOKEN"]}, timeout=10)
+                if resp.status_code == 200 and 'data' in resp.json():
+                    data = resp.json()['data']
+                    if len(data) > 1000:
+                        df = pd.DataFrame(data)
+                        # 保留需要的欄位，並重命名以符合現有格式
+                        df_to_save = df[['stock_id', 'stock_name', 'industry_category']].rename(columns={'stock_id': 'code', 'stock_name': 'name', 'industry_category': 'category'})
+                        df_to_save.to_csv(file_path, index=False, encoding='utf-8-sig')
+                        logging.info("✅ 股票代碼清單更新完成！")
+                        st.cache_data.clear() # 清除緩存以讀取新資料
+            except Exception as e:
+                logging.error(f"❌ 自動更新股票清單失敗: {e}")
+
+    @staticmethod
     @st.cache_data(ttl=3600)
     def load_stock_dict():
         for path in ['twse_listed_codes.csv', 'data/twse_listed_codes.csv']:
             if os.path.exists(path):
                 try:
-                    df = pd.read_csv(path, encoding='utf-8-sig', header=None)
+                    df = pd.read_csv(path, encoding='utf-8-sig', header=0) # header=0 to skip the 'code,name,category' row
                     return dict(zip(df.iloc[:,0].astype(str).str.strip().str.zfill(4), df.iloc[:,1].astype(str).str.strip()))
                 except: pass
         return {}
 
     @staticmethod
-    def fetch_stock_data(stock_id):
+    def fetch_stock_data(stock_id, force_refresh=False):
         stock_id = str(stock_id).strip().zfill(4)
         table_name = f"price_{stock_id}"
         required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
         
-        try:
-            df = pd.read_sql(f"SELECT * FROM {table_name}", DB_CONN, index_col="Date", parse_dates=["Date"])
-            if not df.empty and all(col in df.columns for col in required_cols):
-                if (datetime.datetime.now().date() - df.index.max().date()).days <= 1:
-                    return DataEngine._precompute_indicators(df)
-        except: pass
+        # 取得目前時間資訊
+        now = datetime.datetime.now()
+        is_trading_time = now.weekday() < 5 and (9 <= now.hour < 14)
+        
+        if not force_refresh:
+            try:
+                df = pd.read_sql(f"SELECT * FROM {table_name}", DB_CONN, index_col="Date", parse_dates=["Date"])
+                if not df.empty and all(col in df.columns for col in required_cols):
+                    last_date = df.index.max().date()
+                    # 如果資料是昨天的或更早，或者今天是交易時間且資料是今天的（但可能需要更新），則不直接回傳
+                    if last_date < now.date() or (last_date == now.date() and is_trading_time):
+                        pass # 繼續往下抓取新資料
+                    else:
+                        return DataEngine._precompute_indicators(df)
+            except: pass
 
         df = pd.DataFrame()
         start_date = (datetime.datetime.now() - datetime.timedelta(days=250)).strftime("%Y-%m-%d")
 
+        # 嘗試從 FinMind 獲取
         try:
             url = "https://api.finmindtrade.com/api/v4/data"
             resp = requests.get(url, params={"dataset": "TaiwanStockPrice", "data_id": stock_id, "start_date": start_date, "token": CONFIG["FINMIND_TOKEN"]}, timeout=8)
@@ -134,7 +172,8 @@ class DataEngine:
                     df.set_index('Date', inplace=True)
         except: pass
 
-        if df.empty or 'Close' not in df.columns:
+        # 如果 FinMind 失敗或沒資料，嘗試 yfinance
+        if df.empty or 'Close' not in df.columns or (df.index.max().date() < now.date() and is_trading_time):
             for suffix in ['.TW', '.TWO']:
                 try:
                     df_yf = yf.download(f"{stock_id}{suffix}", period="1y", progress=False)
@@ -142,12 +181,25 @@ class DataEngine:
                         if isinstance(df_yf.columns, pd.MultiIndex):
                             df_yf.columns = df_yf.columns.get_level_values(0)
                         df_yf.index = df_yf.index.tz_localize(None)
-                        df = df_yf
-                        break
+                        # 如果 yfinance 有更新的資料，則採用
+                        if df.empty or df_yf.index.max() >= df.index.max():
+                            df = df_yf
+                            break
                 except: continue
 
         if df.empty: return pd.DataFrame()
-        if not all(col in df.columns for col in required_cols): return pd.DataFrame()
+        
+        # 確保必要的欄位存在且格式正確
+        for col in required_cols:
+            if col not in df.columns:
+                # 嘗試修復常見欄位名稱問題
+                for alt in [col.lower(), col.upper()]:
+                    if alt in df.columns:
+                        df[col] = df[alt]
+                        break
+        
+        if not all(col in df.columns for col in required_cols): 
+            return pd.DataFrame()
             
         df = df[required_cols].astype(float).ffill().dropna(subset=['Close'])
         try:
@@ -271,14 +323,23 @@ class StrategyEngine:
         scores = {'tech': 0, 'chips': 0, 'fund': 0}
         signals = []
         
-        # --- 1. 技術面優化 ---
+        # --- 1. 技術面優化 (35%) ---
+        # 趨勢與均線 (15 pts)
         if c_price > ma60 and ma20 > ma60: scores['tech'] += 5; signals.append("✅ 完美多頭排列")
-        if c_price > ma20: scores['tech'] += 5; signals.append("🟡 價格站上月線")
-        if c_vol > vol_ma5 * 1.5: scores['tech'] += 10; signals.append("💥 量能爆發")
-        if 40 < rsi < 70: scores['tech'] += 5; signals.append("🟢 RSI 健康 (未過熱)")
-        elif rsi >= 75: signals.append("⚠️ RSI 嚴重過熱")
+        elif c_price > ma20: scores['tech'] += 3; signals.append("🟡 價格站上月線")
         
-        # 相對強度 RS (20日)
+        if c_price > ma5: scores['tech'] += 3; signals.append("🚀 短線強勢 (MA5)")
+        
+        # 量能 (10 pts)
+        if c_vol > vol_ma5 * 2.0: scores['tech'] += 10; signals.append("💥 成交量巨量爆發")
+        elif c_vol > vol_ma5 * 1.3: scores['tech'] += 5; signals.append("📈 量能增溫")
+        
+        # 指標 (10 pts)
+        if 35 < rsi < 65: scores['tech'] += 5; signals.append("🟢 RSI 健康 (未過熱)")
+        elif rsi < 30: scores['tech'] += 8; signals.append("🛡️ RSI 超賣區 (潛在反彈)")
+        elif rsi >= 80: scores['tech'] -= 10; signals.append("⚠️ RSI 嚴重超買")
+
+        # 相對強度 RS (5 pts)
         df_index = DataEngine.fetch_index_data()
         if not df_index.empty:
             stock_ret = (c_price - df_price['Close'].iloc[-20]) / df_price['Close'].iloc[-20] if len(df_price) >= 20 else 0
@@ -286,32 +347,59 @@ class StrategyEngine:
             if stock_ret > idx_ret:
                 scores['tech'] += 5; signals.append("📈 強於大盤 (RS)")
             
-        # --- 2. 籌碼面優化 (連買邏輯) ---
+        # --- 2. 籌碼面優化 (35%) ---
         if not df_chips.empty and 'name' in df_chips.columns:
             df_foreign = df_chips[df_chips['name'].str.contains('外資', na=False)]
             df_trust = df_chips[df_chips['name'].str.contains('投信', na=False)]
             
-            f_trend = (df_foreign.tail(3)['buy'].values > df_foreign.tail(3)['sell'].values).all() if len(df_foreign) >= 3 else False
-            t_trend = (df_trust.tail(3)['buy'].values > df_trust.tail(3)['sell'].values).all() if len(df_trust) >= 3 else False
+            # 連買邏輯 (25 pts)
+            f_buy_days = 0
+            for i in range(1, min(len(df_foreign)+1, 6)):
+                if df_foreign.iloc[-i]['buy'] > df_foreign.iloc[-i]['sell']: f_buy_days += 1
+                else: break
             
-            if f_trend: scores['chips'] += 20; signals.append("🌍 外資連續 3 日吸籌")
-            elif (df_foreign.tail(1)['buy'].sum() > df_foreign.tail(1)['sell'].sum()): scores['chips'] += 10; signals.append("🌍 外資今日買超")
-            
-            if t_trend: scores['chips'] += 20; signals.append("🏦 投信連續 3 日佈局")
-            elif (df_trust.tail(1)['buy'].sum() > df_trust.tail(1)['sell'].sum()): scores['chips'] += 10; signals.append("🏦 投信今日買超")
-        else: scores['chips'] = 15
+            t_buy_days = 0
+            for i in range(1, min(len(df_trust)+1, 6)):
+                if df_trust.iloc[-i]['buy'] > df_trust.iloc[-i]['sell']: t_buy_days += 1
+                else: break
 
-        # --- 3. 基本面優化 ---
+            if f_buy_days >= 3: scores['chips'] += 15; signals.append(f"🌍 外資連買 {f_buy_days} 日")
+            elif f_buy_days >= 1: scores['chips'] += 5; signals.append("🌍 外資今日買超")
+            
+            if t_buy_days >= 3: scores['chips'] += 20; signals.append(f"🏦 投信連買 {t_buy_days} 日")
+            elif t_buy_days >= 1: scores['chips'] += 10; signals.append("🏦 投信今日買超")
+            
+            # 集中度 (10 pts) - 簡化判斷
+            total_buy = df_chips['buy'].sum()
+            total_sell = df_chips['sell'].sum()
+            if total_buy > total_sell * 1.2: scores['chips'] += 10; signals.append("💎 籌碼高度集中")
+        else: 
+            # 數據缺失時給予中性分 (15 pts)，避免因 API 失敗導致評分過低
+            scores['chips'] = 15
+            signals.append("⚪ 籌碼數據不足 (中性)")
+
+        # --- 3. 基本面優化 (30%) ---
         if not df_fund.empty and 'revenue_year_on_year_growth_rate' in df_fund.columns:
             latest_yoy = df_fund['revenue_year_on_year_growth_rate'].iloc[-1]
-            if latest_yoy > 20: scores['fund'] += 30; signals.append(f"🚀 營收爆發式成長 ({latest_yoy}%)")
-            elif latest_yoy > 0: scores['fund'] += 15; signals.append(f"穩 營收正成長")
-        else: scores['fund'] = 10
+            # 營收成長 (20 pts)
+            if latest_yoy > 50: scores['fund'] += 20; signals.append(f"🚀 營收爆發 ({latest_yoy}%)")
+            elif latest_yoy > 20: scores['fund'] += 15; signals.append(f"📈 營收高成長 ({latest_yoy}%)")
+            elif latest_yoy > 0: scores['fund'] += 10; signals.append(f"穩 營收正成長")
+            
+            # 趨勢 (10 pts)
+            if len(df_fund) >= 3 and df_fund['revenue_year_on_year_growth_rate'].iloc[-1] > df_fund['revenue_year_on_year_growth_rate'].iloc[-2]:
+                scores['fund'] += 10; signals.append("📈 成長動能轉強")
+        else: 
+            # 數據缺失時給予中性分 (10 pts)
+            scores['fund'] = 10
+            signals.append("⚪ 基本面數據不足 (中性)")
 
         total_score = sum(scores.values())
-        if total_score >= 80: status, status_color = "🔥🔥 強力買入", "#34d399"
-        elif total_score >= 65: status, status_color = "🔥 買入訊號", "#10b981"
-        elif total_score >= 45: status, status_color = "👀 觀察中", "#fbbf24"
+        
+        # 調整閾值：更符合實戰觀察
+        if total_score >= 75: status, status_color = "🔥🔥 強力買入", "#34d399"
+        elif total_score >= 60: status, status_color = "🔥 買入訊號", "#10b981"
+        elif total_score >= 40: status, status_color = "👀 觀察中", "#fbbf24"
         else: status, status_color = "⏸️ 觀望", "#9ca3af"
         
         # --- 4. 終極買點判斷 ---
@@ -431,6 +519,7 @@ def render_dashboard(code, stock_dict):
             st.table(pd.DataFrame(diag_results))
             if any("❌" in r["狀態"] for r in diag_results):
                 st.error("⚠️ 偵測到關鍵檔案缺失，請確認路徑。")
+    
     with st.spinner(f"🔄 分析 {code} 戰情數據中..."):
         df_price = DataEngine.fetch_stock_data(code)
         df_chips = DataEngine.fetch_chips_data(code)
@@ -442,6 +531,7 @@ def render_dashboard(code, stock_dict):
         return
 
     df = metrics['df']
+    last_update_time = df.index.max().strftime("%Y-%m-%d %H:%M")
     full_name = f"{code} {stock_dict.get(code, '')}".strip()
     c_price = metrics['price']
     last_price = df['Close'].iloc[-2] if len(df) > 1 else c_price
@@ -454,7 +544,11 @@ def render_dashboard(code, stock_dict):
     elif bias < -0.05: signal, s_color = "🔵 弱勢探底", "#3b82f6"
     else: signal, s_color = "🟢 穩健區間", "#10b981"
 
-    st.markdown(f"<h2>{full_name} <span style='color:{status_color}; font-size:1.5rem;'>{c_price:.2f} ({chg_pct:+.2f}%)</span></h2>", unsafe_allow_html=True)
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        st.markdown(f"<h2>{full_name} <span style='color:{status_color}; font-size:1.5rem;'>{c_price:.2f} ({chg_pct:+.2f}%)</span></h2>", unsafe_allow_html=True)
+    with col2:
+        st.markdown(f"<p style='text-align:right; color:#888; margin-top:1.5rem;'>🕒 最後更新: {last_update_time}</p>", unsafe_allow_html=True)
 
     r1_c1, r1_c2, r1_c3 = st.columns([2, 1, 1])
     with r1_c1:
@@ -544,6 +638,7 @@ def render_dashboard(code, stock_dict):
 
 # ==================== 🚀 5. 主程式與擴充模組 ====================
 def main():
+    DataEngine.update_stock_list_if_needed()
     stock_dict = DataEngine.load_stock_dict()
     if 'notified' not in st.session_state: st.session_state.notified = {}
     
@@ -576,6 +671,60 @@ def main():
         if auto_monitor:
             st.success("✅ 循環監控已開啟 (每 5 分鐘掃描)")
 
+    # --- 循環監控執行邏輯 ---
+    if auto_monitor:
+        st.markdown("### 📡 循環監控戰報 (自選股即時掃描)")
+        m_col1, m_col2 = st.columns([2, 1])
+        
+        with m_col1:
+            found_monitor = []
+            codes_to_monitor = st.session_state.watchlist
+            
+            def monitor_task(c):
+                # 強制更新以確保即時性 (在 DataEngine.fetch_stock_data 已有盤中邏輯)
+                df_s = DataEngine.fetch_stock_data(c)
+                if df_s.empty or len(df_s) < 20: return None
+                
+                df_chips = DataEngine.fetch_chips_data(c)
+                df_fund = DataEngine.fetch_fundamental_data(c)
+                res_s = StrategyEngine.analyze_metrics(c, df_s, df_chips, df_fund, source="循環監控")
+                
+                if res_s:
+                    # 計算漲跌
+                    last_c = df_s['Close'].iloc[-2] if len(df_s) > 1 else res_s['price']
+                    chg = ((res_s['price'] - last_c) / last_c) * 100 if last_c > 0 else 0
+                    return {"代碼": c, "名稱": stock_dict.get(c, ""), "現價": res_s['price'], "漲跌%": round(chg, 2), "評分": res_s['total_score'], "狀態": res_s['status']}
+                return None
+
+            with ThreadPoolExecutor(max_workers=5) as executor:
+                results = list(executor.map(monitor_task, codes_to_monitor))
+                found_monitor = [r for r in results if r is not None]
+            
+            if found_monitor:
+                monitor_df = pd.DataFrame(found_monitor)
+                # 美化表格顯示
+                def color_chg(val):
+                    color = '#ef4444' if val > 0 else '#10b981' if val < 0 else 'white'
+                    return f'color: {color}'
+                
+                st.dataframe(monitor_df.style.applymap(color_chg, subset=['漲跌%']), use_container_width=True, hide_index=True)
+            else:
+                st.info("⌛ 正在獲取監控數據...")
+        
+        with m_col2:
+            st.markdown(f"""
+                <div class='metric-card' style='padding: 15px;'>
+                    <div class='title-text' style='margin-bottom:10px;'>⏱️ 監控狀態</div>
+                    <p>監控數量: {len(st.session_state.watchlist)}</p>
+                    <p>最後掃描: {datetime.datetime.now().strftime("%H:%M:%S")}</p>
+                    <p style='font-size:0.8rem; color:#888;'>自動頻率: 300s</p>
+                </div>
+            """, unsafe_allow_html=True)
+
+    if selected_code:
+        render_dashboard(selected_code, stock_dict)
+
+    with st.sidebar:
         with st.expander("☁️ 雲端同步與備份 (解決重啟消失)", expanded=False):
             st.caption("Streamlit Cloud 重啟後資料會還原。請將自選名單複製存檔，或在此貼回。")
             current_watchlist_str = ",".join(st.session_state.watchlist)
@@ -586,9 +735,6 @@ def main():
                 with open(WATCHLIST_FILE, 'w') as f: json.dump(st.session_state.watchlist, f)
                 st.success("同步成功！")
                 st.rerun()
-
-    if selected_code:
-        render_dashboard(selected_code, stock_dict)
 
     st.markdown("---")
     
