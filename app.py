@@ -100,30 +100,31 @@ DB_CONN = sqlite3.connect("market_data.db", check_same_thread=False)
 # ==================== 💾 2. 數據引擎 ====================
 class DataEngine:
     @staticmethod
-    def update_stock_list_if_needed():
+    def update_stock_list_if_needed(force=False):
         file_path = 'twse_listed_codes.csv'
-        needs_update = True
+        needs_update = force
         
         # 檢查檔案是否超過 7 天
-        if os.path.exists(file_path):
+        if not needs_update and os.path.exists(file_path):
             file_mtime = datetime.datetime.fromtimestamp(os.path.getmtime(file_path))
             if (datetime.datetime.now() - file_mtime).days < 7:
                 needs_update = False
+            else:
+                needs_update = True
                 
         if needs_update:
             try:
-                logging.info("開始自動更新股票代碼清單...")
+                logging.info("開始更新股票代碼清單...")
                 url = "https://api.finmindtrade.com/api/v4/data"
                 resp = requests.get(url, params={"dataset": "TaiwanStockInfo", "token": CONFIG["FINMIND_TOKEN"]}, timeout=10)
                 if resp.status_code == 200 and 'data' in resp.json():
                     data = resp.json()['data']
                     if len(data) > 1000:
                         df = pd.DataFrame(data)
-                        # 保留需要的欄位，並重命名以符合現有格式
                         df_to_save = df[['stock_id', 'stock_name', 'industry_category']].rename(columns={'stock_id': 'code', 'stock_name': 'name', 'industry_category': 'category'})
                         df_to_save.to_csv(file_path, index=False, encoding='utf-8-sig')
                         logging.info("✅ 股票代碼清單更新完成！")
-                        st.cache_data.clear() # 清除緩存以讀取新資料
+                        st.cache_data.clear() 
             except Exception as e:
                 logging.error(f"❌ 自動更新股票清單失敗: {e}")
 
@@ -150,7 +151,8 @@ class DataEngine:
         
         if not force_refresh:
             try:
-                df = pd.read_sql(f"SELECT * FROM {table_name}", DB_CONN, index_col="Date", parse_dates=["Date"])
+                with DB_LOCK:
+                    df = pd.read_sql(f"SELECT * FROM {table_name}", DB_CONN, index_col="Date", parse_dates=["Date"])
                 if not df.empty and all(col in df.columns for col in required_cols):
                     last_date = df.index.max().date()
                     # 如果資料是昨天的或更早，或者今天是交易時間且資料是今天的（但可能需要更新），則不直接回傳
@@ -643,7 +645,6 @@ def render_dashboard(code, stock_dict):
 
 # ==================== 🚀 5. 主程式與擴充模組 ====================
 def main():
-    DataEngine.update_stock_list_if_needed()
     stock_dict = DataEngine.load_stock_dict()
     if 'notified' not in st.session_state: st.session_state.notified = {}
     
@@ -655,6 +656,15 @@ def main():
 
     with st.sidebar:
         st.title("🛡️ TACTICAL COMMAND")
+        
+        with st.expander("⚙️ 系統維護", expanded=False):
+            if st.button("🔄 手動更新股票清單", use_container_width=True):
+                with st.spinner("正在從 FinMind 獲取最新清單..."):
+                    DataEngine.update_stock_list_if_needed(force=True)
+                    st.success("清單更新完成，請重整頁面。")
+                    st.rerun()
+            st.caption("每週會自動檢查一次，亦可手動觸發。")
+
         new_code = st.text_input("➕ 新增主控標的")
         if st.button("加入清單", use_container_width=True) and new_code:
             code = new_code.strip().zfill(4)
