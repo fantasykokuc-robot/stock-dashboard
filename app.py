@@ -722,7 +722,14 @@ def main():
                     color = '#ef4444' if val > 0 else '#10b981' if val < 0 else 'white'
                     return f'color: {color}'
                 
-                st.dataframe(monitor_df.style.applymap(color_chg, subset=['漲跌%']), use_container_width=True, hide_index=True)
+                # 解決 Pandas 版本相容性問題 (Styler.applymap -> Styler.map)
+                styler = monitor_df.style
+                if hasattr(styler, 'map'):
+                    styled_df = styler.map(color_chg, subset=['漲跌%'])
+                else:
+                    styled_df = styler.applymap(color_chg, subset=['漲跌%'])
+                    
+                st.dataframe(styled_df, use_container_width=True, hide_index=True)
             else:
                 st.info("⌛ 正在獲取監控數據...")
         
