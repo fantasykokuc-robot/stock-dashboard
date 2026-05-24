@@ -254,25 +254,51 @@ class DataEngine:
 
     @staticmethod
     def _precompute_indicators(df):
-        df['MA5'] = df['Close'].rolling(5).mean()
-        df['MA20'] = df['Close'].rolling(20).mean()
-        df['MA60'] = df['Close'].rolling(60).mean()
-        df['VolMA5'] = df['Volume'].rolling(5).mean()
+        # 確保欄位名稱唯一，避免出現多個 'Close' 導致運算錯誤
+        df = df.loc[:, ~df.columns.duplicated()].copy()
         
-        # RSI (14) - 技術指標優化[cite: 9]
-        delta = df['Close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / loss
-        df['RSI'] = 100 - (100 / (1 + rs))
+        # 強制轉換為 Series，避免 yfinance MultiIndex 導致選出 DataFrame
+        def get_series(name):
+            col = df[name]
+            return col.iloc[:, 0] if isinstance(col, pd.DataFrame) else col
 
-        # 波動率 ATR (14)
-        high_low = df['High'] - df['Low']
-        high_close = (df['High'] - df['Close'].shift()).abs()
-        low_close = (df['Low'] - df['Close'].shift()).abs()
-        ranges = pd.concat([high_low, high_close, low_close], axis=1)
-        true_range = ranges.max(axis=1)
-        df['ATR'] = true_range.rolling(14).mean()
+        try:
+            close_s = get_series('Close')
+            vol_s = get_series('Volume')
+            high_s = get_series('High')
+            low_s = get_series('Low')
+
+            df['MA5'] = close_s.rolling(5).mean()
+            df['MA20'] = close_s.rolling(20).mean()
+            df['MA60'] = close_s.rolling(60).mean()
+            df['VolMA5'] = vol_s.rolling(5).mean()
+            
+            # 計算壓力與支撐區間 (近20日高低點)
+            df['Resistance'] = high_s.rolling(20).max()
+            df['Support'] = low_s.rolling(20).min()
+            
+            # 計算買賣點訊號 (MA5 與 MA20 黃金交叉與死亡交叉)
+            df['Signal'] = 0
+            df.loc[(df['MA5'] > df['MA20']) & (df['MA5'].shift(1) <= df['MA20'].shift(1)), 'Signal'] = 1 # 買入訊號
+            df.loc[(df['MA5'] < df['MA20']) & (df['MA5'].shift(1) >= df['MA20'].shift(1)), 'Signal'] = -1 # 賣出訊號
+            
+            # RSI (14)
+            delta = close_s.diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+            rs = gain / loss
+            df['RSI'] = 100 - (100 / (1 + rs))
+
+            # 波動率 ATR (14)
+            high_low = high_s - low_s
+            high_close = (high_s - close_s.shift()).abs()
+            low_close = (low_s - close_s.shift()).abs()
+            ranges = pd.concat([high_low, high_close, low_close], axis=1)
+            true_range = ranges.max(axis=1)
+            df['ATR'] = true_range.rolling(14).mean()
+        except Exception as e:
+            logging.error(f"指標計算失敗: {e}")
+            
         return df
 
     @staticmethod
@@ -563,6 +589,22 @@ def render_dashboard(code, stock_dict):
         fig_k = go.Figure(data=[go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='K線')])
         if not df['MA5'].isna().all(): fig_k.add_trace(go.Scatter(x=df.index, y=df['MA5'], line=dict(color='#eab308', width=1), name='5MA'))
         if not df['MA20'].isna().all(): fig_k.add_trace(go.Scatter(x=df.index, y=df['MA20'], line=dict(color='#60a5fa', width=1), name='20MA'))
+        
+        # 繪製壓力與支撐線
+        if 'Resistance' in df.columns and not pd.isna(df['Resistance'].iloc[-1]):
+            fig_k.add_hline(y=df['Resistance'].iloc[-1], line_dash="dash", line_color="#ef4444", annotation_text="近期壓力", annotation_position="top left", annotation_font_color="#ef4444")
+        if 'Support' in df.columns and not pd.isna(df['Support'].iloc[-1]):
+            fig_k.add_hline(y=df['Support'].iloc[-1], line_dash="dash", line_color="#10b981", annotation_text="近期支撐", annotation_position="bottom left", annotation_font_color="#10b981")
+            
+        # 標註買賣訊號點
+        if 'Signal' in df.columns:
+            buy_points = df[df['Signal'] == 1]
+            if not buy_points.empty:
+                fig_k.add_trace(go.Scatter(x=buy_points.index, y=buy_points['Low'] * 0.98, mode='markers', marker=dict(symbol='triangle-up', size=12, color='#10b981'), name='買入訊號'))
+            sell_points = df[df['Signal'] == -1]
+            if not sell_points.empty:
+                fig_k.add_trace(go.Scatter(x=sell_points.index, y=sell_points['High'] * 1.02, mode='markers', marker=dict(symbol='triangle-down', size=12, color='#ef4444'), name='賣出訊號'))
+
         fig_k.update_layout(title=f"📊 {full_name} K線圖", template='plotly_dark', paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', margin=dict(l=0,r=0,t=30,b=0), height=350, xaxis_rangeslider_visible=False, font=dict(color='white'))
         st.plotly_chart(fig_k, use_container_width=True, theme=None)
         st.markdown("</div>", unsafe_allow_html=True)
