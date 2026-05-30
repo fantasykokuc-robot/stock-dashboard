@@ -49,12 +49,13 @@ class SystemDiagnostics:
 
 # --- 獨立資料夾讀取邏輯 ---
 CONFIG_FILE = os.path.join("config", "settings.json")
-# 預設 Token (僅供本地快速測試)
-FINMIND_TOKEN_DEFAULT = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjoiZmFudGFzeWtva3VjIiwiZW1haWwiOiJmYW50YXN5a29rdWNAZ21haWwuY29tIiwidG9rZW5fdmVyc2lvbiI6MH0.IOQSYqSUC6uaHIyXKf-OEDDYwLbT0D-Hw-H0rpKqD8Q"
+# Token 從環境變數或 Streamlit Secrets 讀取，不再硬編碼於原始碼中
+FINMIND_TOKEN_DEFAULT = os.environ.get("FINMIND_TOKEN", "")
 
 CONFIG = {
     "FINMIND_TOKEN": FINMIND_TOKEN_DEFAULT,
     "LINE_TOKENS": [],
+    "LINE_BOTS": [],
     "TG_BOT_TOKEN": "",
     "TG_CHAT_IDS": []
 }
@@ -64,12 +65,14 @@ if os.path.exists(CONFIG_FILE):
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             CONFIG.update(json.load(f))
-    except: pass
+    except Exception as e:
+        logging.warning(f"讀取設定檔失敗: {e}")
 
 # 整合 Streamlit Secrets
 try:
     if "FINMIND_TOKEN" in st.secrets: CONFIG["FINMIND_TOKEN"] = st.secrets["FINMIND_TOKEN"]
     if "LINE_TOKENS" in st.secrets: CONFIG["LINE_TOKENS"] = st.secrets["LINE_TOKENS"]
+    if "LINE_BOTS" in st.secrets: CONFIG["LINE_BOTS"] = st.secrets["LINE_BOTS"]
     if "TG_BOT_TOKEN" in st.secrets: CONFIG["TG_BOT_TOKEN"] = st.secrets["TG_BOT_TOKEN"]
     if "TG_CHAT_IDS" in st.secrets: CONFIG["TG_CHAT_IDS"] = st.secrets["TG_CHAT_IDS"]
 except:
@@ -96,6 +99,15 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 DB_CONN = sqlite3.connect("market_data.db", check_same_thread=False)
+try:
+    DB_CONN.execute("PRAGMA journal_mode=WAL;")
+except Exception as e:
+    logging.warning(f"WAL 模式啟用失敗: {e}")
+
+def _safe_table_name(prefix, stock_id):
+    """防止 SQL 注入：僅保留英數字元"""
+    clean_id = ''.join(c for c in str(stock_id) if c.isalnum())
+    return f"{prefix}_{clean_id}"
 
 # ==================== 💾 2. 數據引擎 ====================
 class DataEngine:
@@ -142,7 +154,7 @@ class DataEngine:
     @staticmethod
     def fetch_stock_data(stock_id, force_refresh=False):
         stock_id = str(stock_id).strip().zfill(4)
-        table_name = f"price_{stock_id}"
+        table_name = _safe_table_name("price", stock_id)
         required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
         
         # 取得目前時間資訊
@@ -167,6 +179,7 @@ class DataEngine:
 
         # 嘗試從 FinMind 獲取
         try:
+            time.sleep(random.uniform(0.2, 0.5))
             url = "https://api.finmindtrade.com/api/v4/data"
             resp = requests.get(url, params={"dataset": "TaiwanStockPrice", "data_id": stock_id, "start_date": start_date, "token": CONFIG["FINMIND_TOKEN"]}, timeout=8)
             if resp.status_code == 200 and 'data' in resp.json() and len(resp.json()['data']) > 0:
@@ -217,26 +230,71 @@ class DataEngine:
         return DataEngine._precompute_indicators(df)
 
     @staticmethod
-    def fetch_chips_data(stock_id):
+    def fetch_chips_data(stock_id, force_refresh=False):
         stock_id = str(stock_id).strip().zfill(4)
+        table_name = _safe_table_name("chips", stock_id)
+        
+        if not force_refresh:
+            try:
+                with DB_LOCK:
+                    df = pd.read_sql(f"SELECT * FROM {table_name}", DB_CONN, index_col="date", parse_dates=["date"])
+                if not df.empty:
+                    last_date = df.index.max().date()
+                    now = datetime.datetime.now()
+                    days_diff = (now.date() - last_date).days
+                    # 修正週末快取失效問題：3 天內 (涵蓋六日) 且下午 5 點前視為有效
+                    if days_diff == 0 or (days_diff <= 3 and now.hour < 17):
+                        return df
+            except: pass
+
         start_date = (datetime.datetime.now() - datetime.timedelta(days=30)).strftime("%Y-%m-%d")
         try:
+            time.sleep(random.uniform(0.2, 0.5))
             url = "https://api.finmindtrade.com/api/v4/data"
             resp = requests.get(url, params={"dataset": "TaiwanStockInstitutionalInvestorsBuySell", "data_id": stock_id, "start_date": start_date, "token": CONFIG["FINMIND_TOKEN"]}, timeout=5)
             if resp.status_code == 200 and 'data' in resp.json() and len(resp.json()['data']) > 0:
-                return pd.DataFrame(resp.json()['data'])
+                df = pd.DataFrame(resp.json()['data'])
+                if 'date' in df.columns:
+                    df['date'] = pd.to_datetime(df['date'])
+                    df.set_index('date', inplace=True)
+                try:
+                    with DB_LOCK:
+                        df.to_sql(table_name, DB_CONN, if_exists="replace", index=True)
+                except: pass
+                return df
         except: pass
         return pd.DataFrame()
 
     @staticmethod
-    def fetch_fundamental_data(stock_id):
+    def fetch_fundamental_data(stock_id, force_refresh=False):
         stock_id = str(stock_id).strip().zfill(4)
+        table_name = _safe_table_name("fund", stock_id)
+        
+        if not force_refresh:
+            try:
+                with DB_LOCK:
+                    df = pd.read_sql(f"SELECT * FROM {table_name}", DB_CONN, index_col="date", parse_dates=["date"])
+                if not df.empty:
+                    last_date = df.index.max()
+                    if (datetime.datetime.now() - last_date).days < 40:
+                        return df
+            except: pass
+
         start_date = (datetime.datetime.now() - datetime.timedelta(days=120)).strftime("%Y-%m-%d")
         try:
+            time.sleep(random.uniform(0.2, 0.5))
             url = "https://api.finmindtrade.com/api/v4/data"
             resp = requests.get(url, params={"dataset": "TaiwanStockMonthRevenue", "data_id": stock_id, "start_date": start_date, "token": CONFIG["FINMIND_TOKEN"]}, timeout=5)
             if resp.status_code == 200 and 'data' in resp.json() and len(resp.json()['data']) > 0:
-                return pd.DataFrame(resp.json()['data'])
+                df = pd.DataFrame(resp.json()['data'])
+                if 'date' in df.columns:
+                    df['date'] = pd.to_datetime(df['date'])
+                    df.set_index('date', inplace=True)
+                try:
+                    with DB_LOCK:
+                        df.to_sql(table_name, DB_CONN, if_exists="replace", index=True)
+                except: pass
+                return df
         except: pass
         return pd.DataFrame()
 
@@ -313,7 +371,7 @@ class DataEngine:
     # 🛡️ 整合 Telegram 與 LINE 發送引擎
     @staticmethod
     def broadcast_message(message):
-        # 1. 發送 LINE (支援多組 Token)
+        # 1. 發送 LINE Notify
         line_tokens = CONFIG.get("LINE_TOKENS", [])
         for token in line_tokens:
             try:
@@ -324,7 +382,23 @@ class DataEngine:
                     timeout=10
                 )
             except Exception as e:
-                logging.error(f"LINE 推播失敗: {e}")
+                logging.error(f"LINE Notify 推播失敗: {e}")
+                
+        # 1.5 發送 LINE Messaging API (官方帳號 Bot)
+        line_bots = CONFIG.get("LINE_BOTS", [])
+        for bot in line_bots:
+            try:
+                token = bot.get("channel_access_token", "")
+                to_id = bot.get("to", "")
+                if token and to_id:
+                    requests.post(
+                        "https://api.line.me/v2/bot/message/push",
+                        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                        json={"to": to_id, "messages": [{"type": "text", "text": message}]},
+                        timeout=10
+                    )
+            except Exception as e:
+                logging.error(f"LINE Bot 推播失敗: {e}")
             
         # 2. 發送 Telegram
         tg_token = CONFIG.get("TG_BOT_TOKEN")
@@ -356,7 +430,7 @@ class StrategyEngine:
         scores = {'tech': 0, 'chips': 0, 'fund': 0}
         signals = []
         
-        # --- 1. 技術面優化 (35%) ---
+        # --- 1. 技術面 (最高約 31 pts) ---
         # 趨勢與均線 (15 pts)
         if c_price > ma60 and ma20 > ma60: scores['tech'] += 5; signals.append("✅ 完美多頭排列")
         elif c_price > ma20: scores['tech'] += 3; signals.append("🟡 價格站上月線")
@@ -437,7 +511,13 @@ class StrategyEngine:
         
         # --- 4. 終極買點判斷 ---
         high_10 = df_price['High'].iloc[-11:-1].max() if len(df_price) >= 11 else df_price['High'].max()
-        is_breakout = (c_price > high_10) and (c_vol > vol_ma5 * 1.8) and (c_price > ma5) and (rsi < 75)
+        
+        bias_20 = (c_price - ma20) / ma20 if ma20 > 0 else 0
+        vol_ma5_yesterday = df_price['VolMA5'].iloc[-2] if len(df_price) > 1 else c_vol
+        vol_yesterday = df_price['Volume'].iloc[-2] if len(df_price) > 1 else c_vol
+        is_vol_contracted = vol_yesterday < vol_ma5_yesterday
+        
+        is_breakout = (c_price > high_10) and (c_vol > vol_ma5 * 1.8) and (c_price > ma5) and (rsi < 75) and (bias_20 < 0.15) and is_vol_contracted
         is_buy = is_breakout and (total_score >= 70)
         
         if is_buy:
@@ -450,7 +530,6 @@ class StrategyEngine:
         high_5, low_5 = df_price['High'].tail(5).max(), df_price['Low'].tail(5).min()
         bull_power = max(10, min(90, int(((c_price - low_5) / (high_5 - low_5)) * 100) if high_5 != low_5 else 50))
         risk_score = min(int((c_vol / vol_ma5) * 35), 95) if vol_ma5 > 0 else 50
-        bias_20 = (c_price - ma20) / ma20 if ma20 > 0 else 0
         up_prob = min(max(int(35 + bias_20 * 200), 15), 75) 
         
         df_vp = df_price.tail(60).copy()
@@ -460,6 +539,30 @@ class StrategyEngine:
             vp_labels, vp_values = [f"{b.left:.1f}-{b.right:.1f}" for b in vp_data.index], vp_data.values
         else:
             vp_labels, vp_values = [f"{c_price:.1f}"], [df_vp['Volume'].sum()]
+
+        win_5d, total_5d, win_10d, total_10d = 0, 0, 0, 0
+        if 'Signal' in df_price.columns:
+            buy_signals = df_price[df_price['Signal'] == 1]
+            for idx, row in buy_signals.iterrows():
+                buy_idx = df_price.index.get_loc(idx)
+                if buy_idx + 5 < len(df_price):
+                    total_5d += 1
+                    if df_price['Close'].iloc[buy_idx + 5] > row['Close']: win_5d += 1
+                if buy_idx + 10 < len(df_price):
+                    total_10d += 1
+                    if df_price['Close'].iloc[buy_idx + 10] > row['Close']: win_10d += 1
+        wr_5 = round(win_5d / total_5d * 100, 1) if total_5d > 0 else 0
+        wr_10 = round(win_10d / total_10d * 100, 1) if total_10d > 0 else 0
+
+        atr = df_price['ATR'].iloc[-1] if not pd.isna(df_price['ATR'].iloc[-1]) else c_price * 0.02
+        stop_loss = round(c_price - 1.5 * atr, 2)
+        take_profit = round(c_price + 2 * atr, 2)
+        
+        if c_price > ma5 and ma5 > ma20 and ma20 > ma60: trend_desc = "📈 強勢多頭創高"
+        elif c_price < ma5 and ma5 > ma20: trend_desc = "🔄 多頭漲多回檔"
+        elif c_price < ma20 and c_price > ma60: trend_desc = "⚠️ 跌破月線整理"
+        elif c_price < ma60 and rsi < 30: trend_desc = "🛡️ 空頭跌深反彈"
+        else: trend_desc = "📉 偏空弱勢格局"
 
         return {
             "price": round(c_price, 2), "total_score": total_score, "scores": scores,
@@ -472,7 +575,9 @@ class StrategyEngine:
             "r_main": min(max(10 - int(risk_score/10), 2), 9),
             "r_inst": min(max(int(bias_20 * 50) + 6, 2), 9),
             "r_conc": min(max(int(vol_ma5 / df_price['Volume'].mean() * 5) + 3, 3), 9) if df_price['Volume'].mean() > 0 else 5,
-            "vp_labels": vp_labels, "vp_values": vp_values, "df": df_price, "is_buy": is_buy
+            "vp_labels": vp_labels, "vp_values": vp_values, "df": df_price, "is_buy": is_buy,
+            "stop_loss": stop_loss, "take_profit": take_profit, "trend_desc": trend_desc,
+            "wr_5": wr_5, "wr_10": wr_10, "total_5d": total_5d, "total_10d": total_10d
         }
 
 # ==================== 🏗️ 4. ETF 與產業分析引擎 ====================
@@ -655,6 +760,35 @@ def render_dashboard(code, stock_dict):
         st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown("---")
+    st.markdown("### 🎯 實戰策略指引與回測")
+    r_s1, r_s2, r_s3 = st.columns([1, 1, 1])
+    with r_s1:
+        st.markdown(f"""
+            <div class='metric-card'>
+                <div class='title-text'>📍 買賣點與趨勢</div>
+                <p style='margin-bottom: 5px;'><strong>趨勢研判:</strong> {metrics['trend_desc']}</p>
+                <p style='margin-bottom: 5px;'><strong>防守止損:</strong> <span style='color:#ef4444'>{metrics['stop_loss']}</span> (-1.5 ATR)</p>
+                <p style='margin-bottom: 5px;'><strong>短期停利:</strong> <span style='color:#10b981'>{metrics['take_profit']}</span> (+2.0 ATR)</p>
+            </div>
+        """, unsafe_allow_html=True)
+    with r_s2:
+        st.markdown(f"""
+            <div class='metric-card'>
+                <div class='title-text'>🏆 歷史買入勝率 (5日)</div>
+                <h2 style='text-align:center; margin: 5px 0; color:{"#10b981" if metrics["wr_5"] >= 50 else "#ef4444"};'>{metrics['wr_5']}%</h2>
+                <p style='text-align:center; color:#888; font-size: 0.9rem;'>交易次數: {metrics['total_5d']} 次</p>
+            </div>
+        """, unsafe_allow_html=True)
+    with r_s3:
+        st.markdown(f"""
+            <div class='metric-card'>
+                <div class='title-text'>🏆 歷史買入勝率 (10日)</div>
+                <h2 style='text-align:center; margin: 5px 0; color:{"#10b981" if metrics["wr_10"] >= 50 else "#ef4444"};'>{metrics['wr_10']}%</h2>
+                <p style='text-align:center; color:#888; font-size: 0.9rem;'>交易次數: {metrics['total_10d']} 次</p>
+            </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown("---")
     st.markdown("### 🧮 核心三因子模型 (籌碼 40% / 技術 30% / 基本 30%)")
     r3_c1, r3_c2 = st.columns([1.5, 2])
     with r3_c1:
@@ -670,15 +804,15 @@ def render_dashboard(code, stock_dict):
         p1, p2, p3 = st.columns(3)
         with p1:
             st.write("💰 **籌碼面**")
-            st.progress(metrics['scores']['chips'] / 40)
+            st.progress(min(max(metrics['scores']['chips'] / 40, 0), 1.0))
             st.caption(f"得分: {metrics['scores']['chips']} / 40")
         with p2:
             st.write("📈 **技術面**")
-            st.progress(metrics['scores']['tech'] / 30)
+            st.progress(min(max(metrics['scores']['tech'] / 30, 0), 1.0))
             st.caption(f"得分: {metrics['scores']['tech']} / 30")
         with p3:
             st.write("🏢 **基本面**")
-            st.progress(metrics['scores']['fund'] / 30)
+            st.progress(min(max(metrics['scores']['fund'] / 30, 0), 1.0))
             st.caption(f"得分: {metrics['scores']['fund']} / 30")
             
         st.markdown("<div style='margin-top: 15px; display: flex; flex-wrap: wrap; gap: 10px;'>", unsafe_allow_html=True)
@@ -691,10 +825,20 @@ def main():
     if 'notified' not in st.session_state: st.session_state.notified = {}
     
     WATCHLIST_FILE, ETF_FILE = 'watchlist.json', 'etf_list.json'
+
+    def _load_json_file(path, default):
+        if os.path.exists(path):
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception as e:
+                logging.warning(f"讀取 {path} 失敗: {e}")
+        return default
+
     if 'watchlist' not in st.session_state:
-        st.session_state.watchlist = json.load(open(WATCHLIST_FILE)) if os.path.exists(WATCHLIST_FILE) else ["2330", "2317", "3481"]
+        st.session_state.watchlist = _load_json_file(WATCHLIST_FILE, ["2330", "2317", "3481"])
     if 'etf_list' not in st.session_state:
-        st.session_state.etf_list = json.load(open(ETF_FILE)) if os.path.exists(ETF_FILE) else ["0050", "0056", "00878", "00713", "00919"]
+        st.session_state.etf_list = _load_json_file(ETF_FILE, ["0050", "0056", "00878", "00713", "00919"])
 
     with st.sidebar:
         st.title("🛡️ TACTICAL COMMAND")
@@ -753,7 +897,7 @@ def main():
                     return {"代碼": c, "名稱": stock_dict.get(c, ""), "現價": res_s['price'], "漲跌%": round(chg, 2), "評分": res_s['total_score'], "狀態": res_s['status']}
                 return None
 
-            with ThreadPoolExecutor(max_workers=5) as executor:
+            with ThreadPoolExecutor(max_workers=3) as executor:
                 results = list(executor.map(monitor_task, codes_to_monitor))
                 found_monitor = [r for r in results if r is not None]
             
@@ -921,11 +1065,15 @@ def main():
                         return {"代碼": c, "名稱": stock_dict.get(c, ""), "價位": res_s['price'], "評分": res_s['total_score'], "狀態": "🔥 放量強勢股"}
                     return None
 
-                with ThreadPoolExecutor(max_workers=8) as executor:
+                with ThreadPoolExecutor(max_workers=3) as executor:
                     future_map = {executor.submit(scan_task, c): c for c in codes_to_scan}
                     for future in as_completed(future_map):
                         completed += 1
-                        res_s = future.result()
+                        try:
+                            res_s = future.result()
+                        except Exception as e:
+                            logging.warning(f"掃描任務異常: {e}")
+                            res_s = None
                         if res_s: found.append(res_s)
                         
                         if completed % 5 == 0 or completed == scan_limit:
